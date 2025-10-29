@@ -1,0 +1,21 @@
+# Secrets
+.env
+
+# Data and checkpoints
+data/ingest/
+data/checkpoints/
+data/curated/
+spark-warehouse/
+
+# Python artifacts
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+*.egg-info/
+
+# Editors/OS
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db

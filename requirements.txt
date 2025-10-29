@@ -1,0 +1,4 @@
+praw==7.7.1
+pyspark==3.5.1
+python-dotenv==1.0.1
+vaderSentiment==3.3.2
