@@ -1,0 +1,78 @@
+# Three fixed brands with config-driven keywords and events
+# You can edit this file to change brands, keywords, events, and subreddits
+
+subreddits:
+  # key subreddits for backfill; live producer currently uses r/all
+  - Apple
+  - technology
+  - android
+  - samsung
+  - Sneakers
+  - iphone
+  - gadgets
+
+brands:
+  - name: Apple
+    canonical: apple
+    keywords:
+      - apple
+      - apple inc
+      - iphone
+      - ios
+      - ipad
+      - macbook
+      - airpods
+      - vision pro
+    events:
+      - wwdc
+      - keynote
+      - launch
+      - update
+      - beta
+      - ios 18
+      - earnings
+  - name: Samsung
+    canonical: samsung
+    keywords:
+      - samsung
+      - galaxy
+      - note
+      - one ui
+      - s23
+      - s24
+      - fold
+      - flip
+    events:
+      - unpacked
+      - launch
+      - update
+      - beta
+      - earnings
+  - name: Nike
+    canonical: nike
+    keywords:
+      - nike
+      - nike inc
+      - swoosh
+      - air jordan
+      - jordan
+      - af1
+      - air force 1
+      - dunk
+    events:
+      - drop
+      - release
+      - collab
+      - restock
+      - earnings
+      - sale
+
+# Global event keywords that apply to any brand (optional)
+global_events:
+  - lawsuit
+  - recall
+  - bug
+  - outage
+  - price cut
+  - rumor
+  - leak

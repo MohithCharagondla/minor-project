@@ -19,3 +19,5 @@ __pycache__/
 .idea/
 .DS_Store
 Thumbs.db
+
+commands.txt
