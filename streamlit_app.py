@@ -10,6 +10,7 @@ try:
     import google.generativeai as genai  # optional, for Gemini sentiment
 except Exception:
     genai = None
+import subprocess
 
 BASE_DIR = os.path.dirname(__file__)
 PARQUET_DIR = os.path.join(BASE_DIR, "data", "parquet")
@@ -99,6 +100,8 @@ def _get_top_for_row(r):
             return pd.Series({"top_permalink": "", "top_text": ""})
         top = posts.sort_values("score", ascending=False).iloc[0]
         permalink = top.get("permalink") if "permalink" in top else top.get("url", "")
+        if isinstance(permalink, str) and permalink and not permalink.lower().startswith("http"):
+            permalink = f"https://reddit.com{permalink}"
         text = top.get("text", "")
         # simple cleanup, truncate for tooltip readability
         text = (text.replace("\n", " ").strip())[:400]
@@ -232,39 +235,55 @@ def compute_sentiment_vader(text: str) -> float:
     except Exception:
         return 0.0
 
-def compute_sentiment_gemini(text: str, api_key: str) -> float:
-    # Very simple JSON-style prompt asking for a normalized compound score in [-1,1]
+def compute_sentiment_gemini_meta(text: str, api_key: str) -> dict:
+    """Ask Gemini for both sentiment and relevancy.
+    Returns dict: {compound: float [-1,1], relevancy: float [0,1] or None, explanation: str|None, raw: str|None}
+    On failure, falls back to VADER compound and relevancy=None.
+    """
     if not text or not api_key or genai is None:
-        return compute_sentiment_vader(text)
+        return {"compound": compute_sentiment_vader(text), "relevancy": None, "explanation": None, "raw": None}
     try:
         genai.configure(api_key=api_key)
         model = genai.GenerativeModel("gemini-1.5-flash")
         prompt = (
-            "Return only a JSON object with keys: compound (float -1..1). "
-            "Task: sentiment of the following text. Text:"\
+            "Respond ONLY with JSON. Keys: "
+            "compound (float in [-1,1]), relevancy (float in [0,1]), explanation (string <=200 chars).\n"
+            "Task: For the following Reddit text, return sentiment and relevancy for whether it's truly about the brand/topic (avoid false positives like random app store links). Text:"\
         ) + "\n" + str(text)[:4000]
         resp = model.generate_content(prompt)
         out = (resp.text or "").strip()
-        # naive parse for compound
         import json, re
         comp = 0.0
+        rel = None
+        expl = None
         try:
             data = json.loads(out)
             comp = float(data.get("compound", 0.0))
+            r = data.get("relevancy", None)
+            if r is not None:
+                rel = float(r)
+            expl = data.get("explanation")
         except Exception:
-            m = re.search(r"compound\s*[:=]\s*(-?\d+\.\d+|-?\d+)", out, re.I)
-            if m:
-                comp = float(m.group(1))
-        # clip to [-1,1]
-        return max(-1.0, min(1.0, comp))
-    except Exception:
-        return compute_sentiment_vader(text)
+            m1 = re.search(r"compound\s*[:=]\s*(-?\d+\.\d+|-?\d+)", out, re.I)
+            if m1:
+                comp = float(m1.group(1))
+            m2 = re.search(r"relevancy\s*[:=]\s*(\d*\.?\d+)", out, re.I)
+            if m2:
+                rel = float(m2.group(1))
+        comp = max(-1.0, min(1.0, comp))
+        if rel is not None:
+            rel = max(0.0, min(1.0, rel))
+        return {"compound": comp, "relevancy": rel, "explanation": expl, "raw": out}
+    except Exception as e:
+        return {"compound": compute_sentiment_vader(text), "relevancy": None, "explanation": f"fallback:{e}", "raw": None}
 
 def compute_sentiment(text: str) -> float:
+    # Compatibility shim: only returns compound
     provider = st.session_state.get("sentiment_provider", "vader")
     if provider == "gemini":
         api_key = st.session_state.get("gemini_api_key") or os.environ.get("GOOGLE_API_KEY")
-        return compute_sentiment_gemini(text, api_key)
+        meta = compute_sentiment_gemini_meta(text, api_key)
+        return float(meta.get("compound", 0.0))
     return compute_sentiment_vader(text)
 
 def _to_epoch_seconds(series: pd.Series) -> pd.Series:
@@ -309,15 +328,72 @@ def gather_new_since(start_epoch: int, brand_name: str, keywords: list[str]):
         dfj = dfj[fa_sec.fillna(0) >= float(start_epoch)]
         if dfj.empty or "text" not in dfj.columns:
             continue
-        # Filter by brand keywords and compute sentiment
+        # Filter by brand keywords
         dfj = dfj[dfj["text"].astype(str).apply(lambda t: match_brand_text(t, keywords))]
         if dfj.empty:
             continue
-        dfj["compound"] = dfj["text"].astype(str).apply(compute_sentiment)
+        # Compute sentiment and (if Gemini) relevancy + console logging; filter by relevancy threshold
+        provider = st.session_state.get("sentiment_provider", "vader")
+        dfj["sent_provider"] = "g" if provider == "gemini" else "v"
+        if provider == "gemini":
+            api_key = st.session_state.get("gemini_api_key") or os.environ.get("GOOGLE_API_KEY")
+            threshold = float(st.session_state.get("relevancy_threshold", 0.5))
+            comps = []
+            rels = []
+            raws = []
+            exps = []
+            for _, r in dfj.iterrows():
+                meta = compute_sentiment_gemini_meta(str(r.get("text", "")), api_key)
+                comp = float(meta.get("compound", 0.0))
+                rel = meta.get("relevancy")
+                comps.append(comp)
+                rels.append(rel)
+                raws.append(meta.get("raw"))
+                exps.append(meta.get("explanation"))
+                # Console log each Gemini evaluation
+                try:
+                    ident = r.get("id") or r.get("permalink") or r.get("url") or "(no-id)"
+                    print(f"[GEMINI] id={ident} relevancy={rel} compound={comp} meta={meta}")
+                except Exception:
+                    pass
+            dfj["compound"] = comps
+            dfj["relevancy"] = rels
+            dfj["gemini_raw"] = raws
+            dfj["gemini_explanation"] = exps
+            # Apply relevancy threshold when available
+            if dfj["relevancy"].notna().any():
+                before = len(dfj)
+                dfj = dfj[dfj["relevancy"].fillna(0.0) >= threshold]
+                dropped = before - len(dfj)
+                if dropped:
+                    print(f"[GEMINI] Dropped {dropped} low-relevancy posts (< {threshold})")
+            if dfj.empty:
+                continue
+        else:
+            dfj["compound"] = dfj["text"].astype(str).apply(compute_sentiment_vader)
         rows.append(dfj)
     if not rows:
         return pd.DataFrame()
     return pd.concat(rows, ignore_index=True)
+
+def _build_live_key(row: pd.Series) -> str:
+    v = row.get("id")
+    if pd.notna(v) and str(v).strip():
+        return f"id:{str(v)}"
+    for c in ("permalink", "url"):
+        v2 = row.get(c)
+        if isinstance(v2, str) and v2.strip():
+            return f"{c}:{v2.strip()}"
+    return f"ts:{row.get('created_utc', row.get('fetched_at',''))}:sr:{row.get('subreddit','')}:a:{row.get('author','')}"
+
+def _add_live_key(df: pd.DataFrame) -> pd.DataFrame:
+    if df is None or df.empty:
+        return df
+    if "live_key" in df.columns:
+        return df
+    df2 = df.copy()
+    df2["live_key"] = df2.apply(_build_live_key, axis=1)
+    return df2
 
 # Session state init
 if "tracking" not in st.session_state:
@@ -326,6 +402,22 @@ if "track_start" not in st.session_state:
     st.session_state.track_start = None
 if "live_points" not in st.session_state:
     st.session_state.live_points = []  # list of dicts: {ts, mentions, avg_compound, top_permalink, top_text}
+if "seen_ids" not in st.session_state:
+    st.session_state.seen_ids = set()
+if "last_seen_epoch" not in st.session_state:
+    st.session_state.last_seen_epoch = None
+if "producer_running" not in st.session_state:
+    st.session_state.producer_running = False
+if "producer_proc" not in st.session_state:
+    st.session_state.producer_proc = None
+if "producer_brand" not in st.session_state:
+    st.session_state.producer_brand = None
+if "auto_start_producer" not in st.session_state:
+    st.session_state.auto_start_producer = True
+if "include_idle_points" not in st.session_state:
+    st.session_state.include_idle_points = False
+if "producer_flush" not in st.session_state:
+    st.session_state.producer_flush = 5
 
 cfg = load_cfg(os.path.join(BASE_DIR, "config", "brands.yml"))
 brand_keywords = get_brand_keywords(cfg, brand)
@@ -342,32 +434,77 @@ with prov_col[1]:
         st.session_state.gemini_api_key = st.text_input("Gemini API key", type="password", value=st.session_state.get("gemini_api_key", ""))
         if genai is None:
             st.info("Install google-generativeai to use Gemini: pip install google-generativeai")
+with prov_col[2]:
+    if st.session_state.sentiment_provider == "gemini":
+        st.session_state.relevancy_threshold = st.slider(
+            "Gemini relevancy threshold", min_value=0.0, max_value=1.0,
+            value=float(st.session_state.get("relevancy_threshold", 0.5)), step=0.05,
+            help="Only include posts with Gemini relevancy >= threshold"
+        )
 
-controls = st.columns([1,1,3])
+def start_producer(selected_brand: str, flush_interval: int = 5):
+    if st.session_state.producer_running and st.session_state.producer_brand == selected_brand:
+        return
+    try:
+        py = sys.executable
+        script = os.path.join(BASE_DIR, "reddit_stream_producer.py")
+        args = [py, script, "--brand", selected_brand, "--flush-interval", str(flush_interval)]
+        proc = subprocess.Popen(args, cwd=BASE_DIR)
+        st.session_state.producer_proc = proc
+        st.session_state.producer_running = True
+        st.session_state.producer_brand = selected_brand
+    except Exception as e:
+        st.warning(f"Could not start producer: {e}")
+
+def stop_producer():
+    try:
+        proc = st.session_state.get("producer_proc")
+        if proc and proc.poll() is None:
+            proc.terminate()
+    except Exception:
+        pass
+    st.session_state.producer_proc = None
+    st.session_state.producer_running = False
+    st.session_state.producer_brand = None
+
+controls = st.columns([1,1,1,2])
 with controls[0]:
     if not st.session_state.tracking:
         if st.button("Start tracking"):
             st.session_state.tracking = True
             st.session_state.track_start = int(time.time())
             st.session_state.live_points = []
+            if st.session_state.get("auto_start_producer", True):
+                start_producer(brand, flush_interval=st.session_state.get("producer_flush", 5))
             st.rerun()
     else:
         if st.button("Stop tracking"):
             st.session_state.tracking = False
+            if st.session_state.get("auto_start_producer", True):
+                stop_producer()
             st.rerun()
 with controls[1]:
     st.write("")
     st.write("Tracking: " + ("ON" if st.session_state.tracking else "OFF"))
+with controls[2]:
+    st.session_state.auto_start_producer = st.checkbox("Auto-start producer", value=st.session_state.get("auto_start_producer", True))
+    st.session_state.include_idle_points = st.checkbox("Include idle points", value=st.session_state.get("include_idle_points", False))
+with controls[3]:
+    st.session_state.producer_flush = st.number_input("Producer flush interval (s)", min_value=1, max_value=60, value=int(st.session_state.get("producer_flush", 5)), step=1)
+    if st.session_state.producer_running:
+        st.caption(f"Producer running for {st.session_state.producer_brand} (PID: {st.session_state.producer_proc.pid if st.session_state.producer_proc else 'n/a'})")
 
 live_container = st.container()
 
 def append_live_point(posts_df: pd.DataFrame):
     now_ts = pd.Timestamp.utcnow()
     if posts_df is None or posts_df.empty:
-        st.session_state.live_points.append({
-            "ts": now_ts, "mentions": 0, "avg_compound": 0.0,
-            "top_permalink": "", "top_text": ""
-        })
+        # Only append idle zero points if opted in
+        if st.session_state.get("include_idle_points", False):
+            st.session_state.live_points.append({
+                "ts": now_ts, "mentions": 0, "avg_compound": 0.0,
+                "top_permalink": "", "top_text": ""
+            })
         return
     mentions = int(len(posts_df))
     avg_compound = float(posts_df["compound"].mean()) if "compound" in posts_df.columns else 0.0
@@ -377,6 +514,8 @@ def append_live_point(posts_df: pd.DataFrame):
     permalink = None
     if isinstance(top, pd.Series):
         permalink = top.get("permalink") or top.get("url") or ""
+        if isinstance(permalink, str) and permalink and not permalink.lower().startswith("http"):
+            permalink = f"https://reddit.com{permalink}"
     text = top.get("text", "") if isinstance(top, pd.Series) else ""
     text = (str(text).replace("\n", " ").strip())[:400]
     st.session_state.live_points.append({
@@ -385,6 +524,7 @@ def append_live_point(posts_df: pd.DataFrame):
         "avg_compound": avg_compound,
         "top_permalink": permalink or "",
         "top_text": text,
+        "provider": ("g" if st.session_state.get("sentiment_provider", "vader") == "gemini" else "v"),
     })
     # Keep last ~200 points
     if len(st.session_state.live_points) > 200:
@@ -394,12 +534,34 @@ if st.session_state.tracking:
     # Backfill window to include very recent items even if fetched slightly before start
     bf_mins = st.sidebar.number_input("Live backfill window (mins)", min_value=0, max_value=60, value=2, step=1,
                                       help="Include posts newer than now - this window (helps when producer timing differs)")
-    since_epoch = max(int(st.session_state.track_start or time.time()), int(time.time()) - bf_mins * 60)
-    new_posts = gather_new_since(since_epoch, brand, brand_keywords)
-    append_live_point(new_posts)
+    base_since = st.session_state.last_seen_epoch if st.session_state.last_seen_epoch is not None else int(st.session_state.track_start or time.time())
+    since_epoch = max(int(base_since), int(time.time()) - bf_mins * 60)
+    new_raw = gather_new_since(since_epoch, brand, brand_keywords)
+
+    # Advance waterline using raw batch timestamps
+    if new_raw is not None and not new_raw.empty:
+        ts_col = "fetched_at" if "fetched_at" in new_raw.columns else ("created_utc" if "created_utc" in new_raw.columns else None)
+        if ts_col is not None:
+            mx = _to_epoch_seconds(new_raw[ts_col]).max()
+            if pd.notna(mx):
+                st.session_state.last_seen_epoch = max(int(st.session_state.last_seen_epoch or since_epoch), int(mx))
+
+    # De-duplicate within batch and across ticks
+    new_posts = _add_live_key(new_raw) if new_raw is not None else new_raw
+    if new_posts is not None and not new_posts.empty:
+        new_posts = new_posts.drop_duplicates(subset=["live_key"], keep="last")
+        if st.session_state.seen_ids:
+            new_posts = new_posts[~new_posts["live_key"].isin(st.session_state.seen_ids)]
+        if not new_posts.empty:
+            st.session_state.seen_ids.update(new_posts["live_key"].tolist())
+            append_live_point(new_posts)
 
     live_df = pd.DataFrame(st.session_state.live_points)
     if not live_df.empty:
+        # show provider label next to compound in tooltip
+        if "provider" not in live_df.columns:
+            live_df["provider"] = ("g" if st.session_state.get("sentiment_provider", "vader") == "gemini" else "v")
+        live_df["compound_label"] = live_df.apply(lambda r: f"{r.get('avg_compound', 0.0):.3f} ({r.get('provider','v')})", axis=1)
         c1, c2 = live_container.columns(2)
         with c1:
             st.subheader("Live mentions")
@@ -423,7 +585,7 @@ if st.session_state.tracking:
                 y=alt.Y("avg_compound:Q"),
                 tooltip=[
                     alt.Tooltip("ts:T", title="Time"),
-                    alt.Tooltip("avg_compound:Q", title="Compound"),
+                    alt.Tooltip("compound_label:N", title="Compound (prov)"),
                     alt.Tooltip("top_text:N", title="Top post (excerpt)")
                 ],
                 href=alt.Href("top_permalink:N")
